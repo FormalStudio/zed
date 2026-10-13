@@ -845,6 +845,16 @@ pub enum Decorations {
     },
 }
 
+/// A frame the compositor put on screen, as reported by the platform.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct PresentationTime {
+    /// When the frame turned into light, on the monotonic clock.
+    pub presented: std::time::Instant,
+    /// The display's refresh interval as the compositor predicts it for the next frame; `None`
+    /// when the output has no constant refresh.
+    pub refresh: Option<Duration>,
+}
+
 /// What window controls this platform supports
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct WindowControls {
@@ -1400,6 +1410,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_client_inset(&self, _inset: Pixels) {}
     fn set_client_corner_radii(&self, _radii: Corners<Pixels>) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
+
+    /// When the compositor presented this window's latest frame, where the platform measures
+    /// presentation (Wayland `wp_presentation`).
+    fn last_presentation(&self) -> Option<PresentationTime> {
+        None
+    }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 

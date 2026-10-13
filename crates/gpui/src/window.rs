@@ -7194,6 +7194,12 @@ impl Window {
         self.platform_window.gpu_specs()
     }
 
+    /// When the compositor presented this window's latest frame. Wayland only, through
+    /// `wp_presentation`; `None` elsewhere and before the first presentation.
+    pub fn last_presentation(&self) -> Option<crate::PresentationTime> {
+        self.platform_window.last_presentation()
+    }
+
     /// Perform titlebar double-click action.
     /// This is macOS specific.
     pub fn titlebar_double_click(&self) {

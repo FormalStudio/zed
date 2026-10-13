@@ -143,6 +143,7 @@ pub struct WaylandWindowState {
     /// acked size: acking it right away let the compositor draw the new window geometry around
     /// the old buffer for a frame.
     deferred_configure: Option<(u32, InProgressConfigure)>,
+    last_presentation: Option<gpui::PresentationTime>,
     in_progress_window_controls: Option<WindowControls>,
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
@@ -638,6 +639,7 @@ impl WaylandWindowState {
             in_progress_configure: None,
             resize_throttle: false,
             deferred_configure: None,
+            last_presentation: None,
             client,
             appearance,
             handle,
@@ -1224,6 +1226,10 @@ impl WaylandWindowStatePtr {
             update_window(self.state.borrow_mut());
             self.request_redraw();
         }
+    }
+
+    pub fn set_last_presentation(&self, presentation: gpui::PresentationTime) {
+        self.state.borrow_mut().last_presentation = Some(presentation);
     }
 
     pub fn handle_fractional_scale_event(&self, event: wp_fractional_scale_v1::Event) {
@@ -2067,6 +2073,10 @@ impl PlatformWindow for WaylandWindow {
             let callback = state.surface.frame(&state.globals.qh, state.surface.id());
             state.pending_frame_callback = Some(callback);
         }
+        // Applies to the commit the renderer's present makes.
+        if let Some(presentation) = &state.globals.presentation {
+            presentation.feedback(&state.surface, &state.globals.qh, state.surface.id());
+        }
         if renderer.draw(scene) {
             state.presentation = PresentationState::Presented;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
@@ -2246,6 +2256,10 @@ impl PlatformWindow for WaylandWindow {
             return;
         }
         state.client.update_ime_position(bounds);
+    }
+
+    fn last_presentation(&self) -> Option<gpui::PresentationTime> {
+        self.borrow().last_presentation
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {

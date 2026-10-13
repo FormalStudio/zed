@@ -122,6 +122,17 @@ impl raw_window_handle::HasDisplayHandle for WebDisplaySource {
     }
 }
 
+/// Backends to try in order, and whether the attempt rejects software adapters regardless of
+/// what the caller asked for. Creating the GL backend maps the whole GL driver stack (EGL,
+/// gallium, LLVM, about 59 MB resident) even when Vulkan is selected, so it is only created when
+/// Vulkan alone fails. Vulkan alone must reject software adapters, or a software Vulkan driver
+/// (lavapipe) would win before hardware GL is offered.
+#[cfg(not(target_family = "wasm"))]
+const BACKEND_ATTEMPTS: [(wgpu::Backends, bool); 2] = [
+    (wgpu::Backends::VULKAN, true),
+    (wgpu::Backends::VULKAN.union(wgpu::Backends::GL), false),
+];
+
 #[derive(Clone, Copy)]
 pub struct CompositorGpuHint {
     pub vendor_id: u32,
@@ -478,13 +489,57 @@ impl WgpuContext {
 
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>) -> wgpu::Instance {
+        Self::instance_with_backends(display, wgpu::Backends::VULKAN | wgpu::Backends::GL)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn instance_with_backends(
+        display: Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>,
+        backends: wgpu::Backends,
+    ) -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
             display,
         })
+    }
+
+    /// Creates the instance, its surface and the context together, trying the backends of
+    /// [`BACKEND_ATTEMPTS`] in order: the surface has to come from the instance used to select
+    /// the adapter, so a failing backend is retried from the instance up.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_with_surface(
+        mut display: impl FnMut() -> Box<dyn wgpu::wgt::WgpuHasDisplayHandle>,
+        mut create_surface: impl FnMut(&wgpu::Instance) -> anyhow::Result<wgpu::Surface<'static>>,
+        config: &WgpuSurfaceConfig,
+        compositor_gpu: Option<CompositorGpuHint>,
+        reject_software: bool,
+    ) -> anyhow::Result<(Self, wgpu::Surface<'static>)> {
+        let mut last_error = anyhow::anyhow!("No GPU backend was attempted");
+        for (backends, always_reject_software) in BACKEND_ATTEMPTS {
+            let instance = Self::instance_with_backends(Some(display()), backends);
+            let reject_software = reject_software || always_reject_software;
+            let attempt = create_surface(&instance).and_then(|surface| {
+                let context = Self::new_with_options(
+                    instance,
+                    &surface,
+                    config,
+                    compositor_gpu,
+                    reject_software,
+                )?;
+                Ok((context, surface))
+            });
+            match attempt {
+                Ok(context_and_surface) => return Ok(context_and_surface),
+                Err(error) => {
+                    log::info!("GPU initialization failed for {backends:?}: {error:#}");
+                    last_error = error.context(format!("{backends:?} initialization failed"));
+                }
+            }
+        }
+        Err(last_error)
     }
 
     pub fn check_compatible_with_surface(&self, surface: &wgpu::Surface<'_>) -> anyhow::Result<()> {
@@ -770,6 +825,22 @@ fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::{DeviceErrorState, parse_pci_id};
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn gl_is_only_created_after_vulkan_alone_fails() {
+        let [(first, first_rejects_software), (second, second_rejects_software)] =
+            super::BACKEND_ATTEMPTS;
+        assert_eq!(first, wgpu::Backends::VULKAN);
+        assert!(!first.contains(wgpu::Backends::GL));
+        assert!(
+            first_rejects_software,
+            "a software Vulkan driver must not win before hardware GL"
+        );
+        assert!(second.contains(wgpu::Backends::GL));
+        assert!(second.contains(wgpu::Backends::VULKAN));
+        assert!(!second_rejects_software);
+    }
 
     #[test]
     fn device_errors_are_observed_independently() {

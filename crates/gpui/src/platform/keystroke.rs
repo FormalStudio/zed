@@ -116,9 +116,10 @@ impl Keystroke {
     ///
     /// Syntax: `[ctrl-][alt-][shift-][cmd-][fn-]key[->key_char]`.
     /// The `key_char` suffix is used for generating test events.
-    /// Use [`Self::parse_with_os`] for dynamic input or the `secondary-` alias.
+    /// `secondary-` resolves with the OS the binary was built for; use [`Self::parse_with_os`]
+    /// for dynamic input or to resolve it with the host the application runs on.
     pub fn parse(source: &'static str) -> std::result::Result<Self, InvalidKeystrokeError> {
-        Self::parse_internal(source, None)
+        Self::parse_internal(source, Some(OperatingSystem::built_for()))
     }
 
     /// Parses a keystroke, resolving `secondary-` using the supplied host OS.
@@ -810,4 +811,18 @@ fn unparse(modifiers: &Modifiers, key: &str, os: OperatingSystem) -> String {
     }
     result.push_str(&key);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Keystroke, OperatingSystem};
+
+    #[test]
+    fn a_static_secondary_keystroke_resolves_with_the_os_it_was_built_for() {
+        let keystroke = Keystroke::parse("secondary-k").unwrap();
+        let mac = OperatingSystem::built_for() == OperatingSystem::Mac;
+        assert_eq!(keystroke.modifiers.platform, mac);
+        assert_eq!(keystroke.modifiers.control, !mac);
+        assert_eq!(keystroke.key, "k");
+    }
 }

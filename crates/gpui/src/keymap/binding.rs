@@ -31,7 +31,8 @@ impl Clone for KeyBinding {
 impl KeyBinding {
     /// Constructs a static keybinding with explicit modifiers. Panics on parse error.
     ///
-    /// Use [`Self::load`] for dynamic input or to resolve `secondary-` using the host OS.
+    /// `secondary-` resolves with the OS the binary was built for; use [`Self::load`] for dynamic
+    /// input or to resolve it with the host the application runs on.
     pub fn new<A: Action>(keystrokes: &'static str, action: A, context: Option<&str>) -> Self {
         let context_predicate =
             context.map(|context| KeyBindingContextPredicate::parse(context).unwrap().into());

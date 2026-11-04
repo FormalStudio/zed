@@ -47,3 +47,25 @@ impl PlatformInfo {
         self.os == OperatingSystem::Mac
     }
 }
+
+impl OperatingSystem {
+    /// The operating system this binary was compiled for. A browser host can differ from it;
+    /// [`crate::App::platform_info`] reports the one the application runs on.
+    pub const fn built_for() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Mac
+        } else if cfg!(target_os = "windows") {
+            Self::Windows
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
+        } else if cfg!(target_os = "freebsd") {
+            Self::FreeBsd
+        } else if cfg!(target_os = "ios") {
+            Self::Ios
+        } else if cfg!(target_os = "android") {
+            Self::Android
+        } else {
+            Self::Unknown
+        }
+    }
+}

@@ -1788,6 +1788,20 @@ impl PlatformWindow for X11Window {
         }
     }
 
+    #[cfg(feature = "test-support")]
+    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<gpui::RgbaImage> {
+        let (width, height, pixels) = self
+            .0
+            .state
+            .borrow_mut()
+            .renderer
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("the window has no renderer"))?
+            .render_to_pixels(scene)?;
+        gpui::RgbaImage::from_raw(width, height, pixels)
+            .ok_or_else(|| anyhow::anyhow!("the read back pixels do not fill {width}x{height}"))
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0
             .state

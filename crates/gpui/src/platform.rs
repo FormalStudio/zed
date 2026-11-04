@@ -52,7 +52,7 @@ use async_task::Runnable;
 use collections::FxHashMap;
 use futures::channel::oneshot;
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
-use image::RgbaImage;
+pub use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, DynamicImage, Frame};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};

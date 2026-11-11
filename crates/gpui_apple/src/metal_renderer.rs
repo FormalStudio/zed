@@ -1,4 +1,5 @@
 use crate::metal_atlas::MetalAtlas;
+use crate::metal_backdrop::Backdrops;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use gpui::{
@@ -150,6 +151,8 @@ pub struct MetalRenderer {
     path_intermediate_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     path_intermediate_msaa_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     path_sample_count: u32,
+    /// Built on the first frame with a backdrop.
+    backdrops: Option<Backdrops>,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -438,6 +441,7 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            backdrops: None,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
         })
@@ -937,6 +941,26 @@ impl MetalRenderer {
                         command_encoder.endEncoding();
                         return Err(error);
                     }
+                }
+                PrimitiveBatch::Backdrops(range) => {
+                    command_encoder.endEncoding();
+                    if self.backdrops.is_none() {
+                        self.backdrops = Some(Backdrops::new(&self.device)?);
+                    }
+                    let backdrops = self.backdrops.as_mut().expect("created above");
+                    let prepared = backdrops.prepare(
+                        &self.device,
+                        &command_buffer,
+                        texture,
+                        &scene.backdrops[range],
+                    )?;
+                    command_encoder = new_command_encoder_for_texture(
+                        &command_buffer,
+                        texture,
+                        viewport_size,
+                        None,
+                    )?;
+                    backdrops.composite(&prepared, &command_encoder);
                 }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
@@ -1928,6 +1952,152 @@ mod tests {
         CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,
     };
     use objc2_metal::MTLCommandBufferStatus;
+
+    fn solid_quad(x: f32, width: f32, color: gpui::Hsla) -> gpui::Quad {
+        let bounds = Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(0.)),
+            size: size(ScaledPixels(width), ScaledPixels(32.)),
+        };
+        gpui::Quad {
+            order: 0,
+            border_style: gpui::BorderStyle::Solid,
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: color.into(),
+            border_color: color,
+            corner_radii: Default::default(),
+            border_widths: Default::default(),
+        }
+    }
+
+    fn backdrop(x: f32, width: f32, blur: f32, tint: gpui::Hsla) -> gpui::Backdrop {
+        let bounds = Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(0.)),
+            size: size(ScaledPixels(width), ScaledPixels(32.)),
+        };
+        gpui::Backdrop {
+            order: 0,
+            source: gpui::BackdropSource::Window,
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Default::default(),
+            blur_radius: ScaledPixels(blur),
+            saturation: 1.,
+            tint,
+            highlight: 0.,
+            highlight_width: ScaledPixels(1.),
+            sample_limit: None,
+            opacity: 1.,
+            fallback: gpui::Hsla::transparent_black(),
+        }
+    }
+
+    #[test]
+    fn headless_renderer_fades_a_backdrop_with_its_opacity() -> Result<()> {
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(0., 64., gpui::red()));
+        let white = gpui::Hsla { a: 0.5, ..gpui::white() };
+        scene.insert_primitive(gpui::Backdrop { opacity: 0.5, ..backdrop(0., 64., 6., white) });
+        scene.finish();
+
+        let image = renderer.render_scene_to_image(&scene, size(DevicePixels(64), DevicePixels(32)))?;
+        assert_pixel(&image, 8, 16, [255, 64, 64, 255]);
+        Ok(())
+    }
+
+    #[test]
+    fn headless_renderer_composites_a_batch_with_nothing_to_blur() -> Result<()> {
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(0., 64., gpui::red()));
+        let white = gpui::Hsla { a: 0.5, ..gpui::white() };
+        let desktop = gpui::Backdrop { source: gpui::BackdropSource::Desktop, ..backdrop(0., 64., 6., white) };
+        scene.insert_primitive(desktop);
+        scene.finish();
+
+        let image = renderer.render_scene_to_image(&scene, size(DevicePixels(64), DevicePixels(32)))?;
+        // The window's content is cleared under a desktop backdrop and its tint laid alone.
+        let [r, g, b, a] = image.get_pixel(8, 16).0;
+        assert!(a.abs_diff(128) <= 3 && r == g && g == b, "pixel was {r} {g} {b} {a}");
+        Ok(())
+    }
+
+    #[test]
+    fn headless_renderer_keeps_an_outside_shadow_off_its_element() -> Result<()> {
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(0., 64., gpui::white()));
+        let element = Bounds {
+            origin: point(ScaledPixels(16.), ScaledPixels(0.)),
+            size: size(ScaledPixels(32.), ScaledPixels(32.)),
+        };
+        let frame = Bounds {
+            origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+            size: size(ScaledPixels(64.), ScaledPixels(32.)),
+        };
+        scene.insert_primitive(gpui::Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.),
+            bounds: Bounds { origin: point(ScaledPixels(24.), ScaledPixels(0.)), ..element },
+            corner_radii: Default::default(),
+            content_mask: ContentMask { bounds: frame },
+            color: gpui::black(),
+            element_bounds: element,
+            element_corner_radii: Default::default(),
+            inset: 2,
+            pad: 0,
+        });
+        scene.finish();
+
+        let image = renderer.render_scene_to_image(&scene, size(DevicePixels(64), DevicePixels(32)))?;
+        assert_pixel(&image, 32, 16, [255, 255, 255, 255]);
+        assert_pixel(&image, 52, 16, [0, 0, 0, 255]);
+        Ok(())
+    }
+
+    fn assert_pixel(image: &RgbaImage, x: u32, y: u32, expected: [u8; 4]) {
+        let actual = image.get_pixel(x, y).0;
+        assert!(
+            actual.iter().zip(expected).all(|(a, e)| a.abs_diff(e) <= 3),
+            "pixel ({x}, {y}) was {actual:?}, expected {expected:?}"
+        );
+    }
+
+    #[test]
+    fn headless_renderer_blurs_what_a_backdrop_covers() -> Result<()> {
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(0., 32., gpui::red()));
+        scene.insert_primitive(solid_quad(32., 32., gpui::blue()));
+        scene.insert_primitive(backdrop(16., 32., 3., gpui::Hsla::transparent_black()));
+        scene.finish();
+
+        let image = renderer.render_scene_to_image(&scene, size(DevicePixels(64), DevicePixels(32)))?;
+        assert_pixel(&image, 15, 16, [255, 0, 0, 255]);
+        assert_pixel(&image, 48, 16, [0, 0, 255, 255]);
+        let [r, g, b, _] = image.get_pixel(32, 16).0;
+        assert!(r.abs_diff(b) < 40 && r > 90 && g < 4, "edge was {r} {g} {b}");
+        assert_pixel(&image, 18, 16, [255, 0, 0, 255]);
+        Ok(())
+    }
+
+    #[test]
+    fn headless_renderer_tints_a_backdrop_and_draws_later_content_sharp() -> Result<()> {
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(0., 64., gpui::red()));
+        let white = gpui::Hsla { a: 0.5, ..gpui::white() };
+        scene.insert_primitive(backdrop(0., 64., 6., white));
+        scene.insert_primitive(solid_quad(32., 32., gpui::blue()));
+        scene.finish();
+
+        let image = renderer.render_scene_to_image(&scene, size(DevicePixels(64), DevicePixels(32)))?;
+        assert_pixel(&image, 8, 16, [255, 128, 128, 255]);
+        assert_pixel(&image, 31, 16, [255, 128, 128, 255]);
+        assert_pixel(&image, 32, 16, [0, 0, 255, 255]);
+        Ok(())
+    }
 
     #[test]
     fn path_intermediate_textures_are_reused_until_resize() -> Result<()> {

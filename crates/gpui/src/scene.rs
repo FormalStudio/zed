@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Point, Radians, Rgba, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -50,6 +50,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub backdrops: Vec<Backdrop>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +67,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.backdrops.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -94,11 +96,16 @@ impl Scene {
             return;
         }
 
-        let order = self
-            .layer_stack
-            .last()
-            .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        let order = if let Primitive::Backdrop(backdrop) = &primitive {
+            // A backdrop samples past its own bounds, so it orders after everything already
+            // painted in that reach, and whatever its layer paints next orders after it.
+            self.primitive_bounds.insert(backdrop.sample_bounds())
+        } else {
+            self.layer_stack
+                .last()
+                .copied()
+                .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds))
+        };
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -133,6 +140,15 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::Backdrop(backdrop) => {
+                backdrop.order = order;
+                self.backdrops.push(*backdrop);
+            }
+        }
+        if matches!(primitive, Primitive::Backdrop(_))
+            && let Some(layer) = self.layer_stack.last_mut()
+        {
+            *layer = self.primitive_bounds.insert(clipped_bounds).max(*layer);
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -160,6 +176,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.backdrops.sort_by_key(|backdrop| backdrop.order);
     }
 
     #[cfg_attr(
@@ -187,6 +204,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            backdrops_start: 0,
+            backdrops_iter: self.backdrops.iter().peekable(),
         }
     }
 }
@@ -200,6 +219,7 @@ impl Scene {
     allow(dead_code)
 )]
 pub(crate) enum PrimitiveKind {
+    Backdrop,
     Shadow,
     #[default]
     Quad,
@@ -228,6 +248,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    Backdrop(Backdrop),
 }
 
 #[expect(missing_docs)]
@@ -242,6 +263,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::Backdrop(backdrop) => &backdrop.bounds,
         }
     }
 
@@ -255,6 +277,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::Backdrop(backdrop) => &backdrop.content_mask,
         }
     }
 }
@@ -283,6 +306,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    backdrops_start: usize,
+    backdrops_iter: Peekable<slice::Iter<'a, Backdrop>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -290,6 +315,10 @@ impl<'a> Iterator for BatchIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut orders_and_kinds = [
+            (
+                self.backdrops_iter.peek().map(|b| b.order),
+                PrimitiveKind::Backdrop,
+            ),
             (
                 self.shadows_iter.peek().map(|s| s.order),
                 PrimitiveKind::Shadow,
@@ -461,6 +490,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::Backdrop => {
+                let backdrops_start = self.backdrops_start;
+                let mut backdrops_end = backdrops_start + 1;
+                let first_order = self.backdrops_iter.next().map(|backdrop| backdrop.order);
+                // Only backdrops of one order have disjoint sample regions (BoundsTree), so
+                // only they may read one copy of the frame and share the scratch textures.
+                while self
+                    .backdrops_iter
+                    .next_if(|backdrop| Some(backdrop.order) == first_order)
+                    .is_some()
+                {
+                    backdrops_end += 1;
+                }
+                self.backdrops_start = backdrops_end;
+                Some(PrimitiveBatch::Backdrops(backdrops_start..backdrops_end))
+            }
         }
     }
 }
@@ -493,6 +538,9 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    /// Backdrops that share a draw order: their sample regions do not overlap, so one copy of
+    /// the frame serves them all.
+    Backdrops(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -525,6 +573,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::Backdrops(range) => format!("backdrops ({})", range.len()),
         }
     }
 }
@@ -580,7 +629,8 @@ pub struct Shadow {
     pub color: Hsla,
     pub element_bounds: Bounds<ScaledPixels>,
     pub element_corner_radii: Corners<ScaledPixels>,
-    /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
+    /// 0 = drop shadow, 1 = inset shadow (rendered inside the element), 2 = drop shadow
+    /// rendered outside the element only.
     pub inset: u32,
     pub pad: u32, // align to 8 bytes
 }
@@ -588,6 +638,90 @@ pub struct Shadow {
 impl From<Shadow> for Primitive {
     fn from(shadow: Shadow) -> Self {
         Primitive::Shadow(shadow)
+    }
+}
+
+/// Where a [`Backdrop`] takes what it blurs from.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[repr(u32)]
+pub enum BackdropSource {
+    /// What the window has drawn behind the element.
+    #[default]
+    Window = 0,
+    /// The desktop behind the window, blurred by the compositor. The element's pixels are
+    /// cleared to its tint and the platform window asks for blur behind them.
+    Desktop = 1,
+}
+
+/// Blurs what lies behind an element's rounded bounds, then lays a tint over it.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct Backdrop {
+    pub order: DrawOrder,
+    pub source: BackdropSource,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Standard deviation of the Gaussian blur.
+    pub blur_radius: ScaledPixels,
+    /// 1 leaves the blurred colours as they are, 0 greys them, above 1 makes them more vivid.
+    pub saturation: f32,
+    /// Laid over the blurred pixels with its alpha.
+    pub tint: Hsla,
+    /// Strength of the light along the rim: full where the edge faces up (tilted a little right,
+    /// as macOS lights Liquid Glass), a third of it where the edge faces down.
+    pub highlight: f32,
+    /// Width of the rim light.
+    pub highlight_width: ScaledPixels,
+    /// The most the blur may read, from [`BackdropFilter::within`].
+    pub sample_limit: Option<Bounds<ScaledPixels>>,
+    /// The element's opacity, scaling the whole composite: blur, tint and rim.
+    pub opacity: f32,
+    /// Laid under the tint instead of the blur where the renderer cannot read the window.
+    pub fallback: Hsla,
+}
+
+impl Backdrop {
+    /// The region the blur reads: the clipped bounds grown by three standard deviations, within
+    /// the sample limit.
+    pub fn sample_bounds(&self) -> Bounds<ScaledPixels> {
+        let sample = self
+            .bounds
+            .intersect(&self.content_mask.bounds)
+            .dilate(self.blur_radius * 3.);
+        match self.sample_limit {
+            Some(limit) => sample.intersect(&limit),
+            None => sample,
+        }
+    }
+
+    /// The tint over the fallback, as one colour: what a renderer lays instead of the blur where
+    /// it cannot read the window.
+    pub fn unblurred_tint(&self) -> Rgba {
+        let (tint, under) = (Rgba::from(self.tint), Rgba::from(self.fallback));
+        let a = tint.a + under.a * (1. - tint.a);
+        if a <= 0. {
+            return tint;
+        }
+        let mix = |t: f32, u: f32| (t * tint.a + u * under.a * (1. - tint.a)) / a;
+        Rgba { r: mix(tint.r, under.r), g: mix(tint.g, under.g), b: mix(tint.b, under.b), a }
+    }
+
+    /// How far renderers shrink the sample region before the blur, a power of two that brings
+    /// the blur under four texels so it needs at most a dozen taps per side.
+    pub fn downsample_factor(&self) -> u32 {
+        let mut factor = 1;
+        while self.blur_radius.0 / factor as f32 > 4. && factor < 16 {
+            factor *= 2;
+        }
+        factor
+    }
+}
+
+impl From<Backdrop> for Primitive {
+    fn from(backdrop: Backdrop) -> Self {
+        Primitive::Backdrop(backdrop)
     }
 }
 
@@ -973,5 +1107,130 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{point, size};
+
+    fn bounds(x: f32, width: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(0.)),
+            size: size(ScaledPixels(width), ScaledPixels(20.)),
+        }
+    }
+
+    fn quad(x: f32, width: f32) -> Quad {
+        Quad {
+            bounds: bounds(x, width),
+            content_mask: ContentMask { bounds: bounds(0., 1000.) },
+            ..Default::default()
+        }
+    }
+
+    fn backdrop(x: f32, width: f32, blur: f32) -> Backdrop {
+        Backdrop {
+            order: 0,
+            source: BackdropSource::Window,
+            bounds: bounds(x, width),
+            content_mask: ContentMask { bounds: bounds(0., 1000.) },
+            corner_radii: Corners::default(),
+            blur_radius: ScaledPixels(blur),
+            saturation: 1.,
+            tint: Hsla::default(),
+            highlight: 0.,
+            highlight_width: ScaledPixels(1.),
+            sample_limit: None,
+            opacity: 1.,
+            fallback: Hsla::default(),
+        }
+    }
+
+    #[test]
+    fn without_the_window_a_backdrop_lays_its_tint_over_its_fallback() {
+        let mut backdrop = backdrop(0., 10., 4.);
+        backdrop.tint = Hsla { a: 0.5, ..crate::white() };
+        backdrop.fallback = crate::black();
+        let c = backdrop.unblurred_tint();
+        assert!((c.r - 0.5).abs() < 1e-3 && (c.a - 1.).abs() < 1e-3, "{c:?}");
+        backdrop.fallback = Hsla::transparent_black();
+        assert_eq!(backdrop.unblurred_tint(), Rgba::from(backdrop.tint));
+    }
+
+    #[test]
+    fn a_sample_limit_bounds_what_a_backdrop_reads() {
+        let mut backdrop = backdrop(0., 100., 4.);
+        assert_eq!(backdrop.sample_bounds().origin.x, ScaledPixels(-12.));
+        backdrop.sample_limit = Some(bounds(0., 1000.));
+        assert_eq!(backdrop.sample_bounds().origin.x, ScaledPixels(0.));
+        assert_eq!(backdrop.sample_bounds().size.width, ScaledPixels(112.));
+    }
+
+    fn kinds(scene: &Scene) -> Vec<&'static str> {
+        scene
+            .batches()
+            .map(|batch| match batch {
+                PrimitiveBatch::Quads(_) => "quads",
+                PrimitiveBatch::Backdrops(_) => "backdrops",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_backdrop_draws_after_what_its_blur_reaches_and_before_what_follows() {
+        let mut scene = Scene::default();
+        // Beside the backdrop, but inside the reach of its blur.
+        scene.insert_primitive(quad(0., 10.));
+        scene.insert_primitive(backdrop(20., 40., 4.));
+        scene.insert_primitive(quad(30., 10.));
+        scene.finish();
+        assert!(scene.quads[0].order < scene.backdrops[0].order);
+        assert!(scene.backdrops[0].order < scene.quads[1].order);
+        assert_eq!(kinds(&scene), ["quads", "backdrops", "quads"]);
+    }
+
+    #[test]
+    fn a_backdrop_in_a_layer_splits_the_layer_around_it() {
+        let mut scene = Scene::default();
+        scene.push_layer(bounds(0., 100.));
+        scene.insert_primitive(quad(0., 100.));
+        scene.insert_primitive(backdrop(10., 50., 4.));
+        scene.insert_primitive(quad(20., 10.));
+        scene.pop_layer();
+        scene.finish();
+        assert_eq!(kinds(&scene), ["quads", "backdrops", "quads"]);
+    }
+
+    #[test]
+    fn backdrops_far_apart_share_a_batch() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0., 1000.));
+        scene.insert_primitive(backdrop(0., 50., 4.));
+        scene.insert_primitive(backdrop(500., 50., 4.));
+        scene.finish();
+        assert_eq!(kinds(&scene), ["quads", "backdrops"]);
+    }
+
+    #[test]
+    fn overlapping_backdrops_with_nothing_between_take_a_batch_each() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0., 1000.));
+        scene.insert_primitive(backdrop(0., 100., 4.));
+        scene.insert_primitive(backdrop(20., 40., 4.));
+        scene.finish();
+        assert!(scene.backdrops[0].order < scene.backdrops[1].order);
+        assert_eq!(kinds(&scene), ["quads", "backdrops", "backdrops"]);
+    }
+
+    #[test]
+    fn a_wide_blur_is_downsampled_to_a_dozen_taps() {
+        assert_eq!(backdrop(0., 10., 0.).downsample_factor(), 1);
+        assert_eq!(backdrop(0., 10., 4.).downsample_factor(), 1);
+        assert_eq!(backdrop(0., 10., 8.).downsample_factor(), 2);
+        assert_eq!(backdrop(0., 10., 30.).downsample_factor(), 8);
+        assert_eq!(backdrop(0., 10., 500.).downsample_factor(), 16);
     }
 }
